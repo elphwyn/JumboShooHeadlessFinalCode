@@ -1,0 +1,482 @@
+#include <SPI.h>
+#include <LoRa.h>
+#include <math.h>
+
+// ---------------- LoRa Pins (Arduino UNO) ----------------
+// These pins connect the Arduino to the LoRa radio module.
+// The LoRa module communicates using SPI, plus reset and interrupt pins.
+const int LORA_CS   = 10;  // Chip Select pin
+const int LORA_RST  = 9;   // Reset pin
+const int LORA_DIO0 = 2;   // Interrupt pin for received packets
+
+// ---------------- 4 Relay Pins ----------------
+// These are the Arduino pins connected to the relay module inputs.
+const int RELAY_PINS[] = {7, 6, 5, 4};
+const int NUM_RELAYS = 4;
+
+// Some relay boards turn ON when the signal is LOW instead of HIGH.
+// false means HIGH turns relay ON.
+// true means LOW turns relay ON.
+const bool RELAY_ACTIVE_LOW = false;
+
+// ---------------- LoRa Settings ----------------
+const long LORA_FREQ = 915E6;       // LoRa frequency used in the US
+const bool USE_SYNC_WORD = false;   // Sync word disabled unless set to true
+const byte SYNC_WORD = 0x12;        // Optional LoRa sync word
+
+// ---------------- Trigger Settings ----------------
+// These are the values this receiver is listening for.
+// If an incoming LoRa message contains a number close to 0.30 or 0.34,
+// the relay sequence will start.
+const float TARGET1 = 0.30f;
+const float TARGET2 = 0.34f;
+const float TOL     = 0.02f;  // Allows small error around the target values
+
+// ---------------- Timing ----------------
+const unsigned long BETWEEN_MS = 2000;   // Pause between sequence stages
+const unsigned long COOLDOWN_MS = 2000;  // Minimum wait after a sequence finishes
+
+// ---------------- Flash Settings ----------------
+// Each relay will randomly flash between 5 and 15 times.
+const int FLASH_MIN = 5;
+const int FLASH_MAX = 15;
+
+// Each relay will stay fully ON for a random time between 3 and 7 seconds.
+const int ON_MIN_SEC = 3;
+const int ON_MAX_SEC = 7;
+
+// Random timing for each flash.
+// This makes the lights look less uniform and more natural/random.
+const unsigned long FLASH_ON_MIN_MS  = 100;
+const unsigned long FLASH_ON_MAX_MS  = 350;
+const unsigned long FLASH_OFF_MIN_MS = 100;
+const unsigned long FLASH_OFF_MAX_MS = 400;
+
+// ---------------- Relay State Machine ----------------
+// A state machine is used so the Arduino does not need long delay() calls.
+// Each relay moves through these states one step at a time.
+enum RelayState {
+  IDLE,               // Relay is off and waiting
+  FIRST_FLASH_ON,     // Relay is ON during first flashing section
+  FIRST_FLASH_OFF,    // Relay is OFF during first flashing section
+  GAP1_OFF,           // Pause after first flashing section
+  STEADY_ON,          // Relay stays fully ON
+  GAP2_OFF,           // Pause after steady ON section
+  SECOND_FLASH_ON,    // Relay is ON during second flashing section
+  SECOND_FLASH_OFF,   // Relay is OFF during second flashing section
+  DONE                // Relay has finished its full sequence
+};
+
+// This struct stores all information needed for one relay.
+// Each relay needs its own timing and counters because all 4 relays
+// run independently with different random patterns.
+struct RelaySequence {
+  RelayState state;              // Current step/state of this relay
+  unsigned long stateStartMs;    // Time when this state started
+
+  int firstFlashesTarget;        // Number of flashes planned for first section
+  int secondFlashesTarget;       // Number of flashes planned for second section
+  int firstFlashCount;           // Number of completed first flashes
+  int secondFlashCount;          // Number of completed second flashes
+
+  unsigned long steadyOnMs;      // How long relay stays fully ON
+  unsigned long flashOnMs;       // How long each flash stays ON
+  unsigned long flashOffMs;      // How long each flash stays OFF
+};
+
+// Creates one RelaySequence object for each relay.
+RelaySequence relays[NUM_RELAYS];
+
+// Tracks whether a relay sequence is currently running.
+bool sequenceRunning = false;
+
+// Stores the time when the last sequence finished.
+// This is used for cooldown timing.
+unsigned long lastTriggerMs = 0;
+
+// If a valid LoRa trigger arrives while the sequence is busy or cooling down,
+// this saves it so it can run once the system is ready.
+bool pendingTrigger = false;
+
+// ---------------- Relay Helper Functions ----------------
+
+// Turns a specific relay ON or OFF.
+// relayIndex chooses which relay.
+// on = true turns it ON.
+// on = false turns it OFF.
+void setRelay(int relayIndex, bool on) {
+  // Prevents the program from using an invalid relay number.
+  if (relayIndex < 0 || relayIndex >= NUM_RELAYS) return;
+
+  // If the relay board is active-low, LOW means ON and HIGH means OFF.
+  if (RELAY_ACTIVE_LOW) {
+    digitalWrite(RELAY_PINS[relayIndex], on ? LOW : HIGH);
+  } 
+  // If the relay board is active-high, HIGH means ON and LOW means OFF.
+  else {
+    digitalWrite(RELAY_PINS[relayIndex], on ? HIGH : LOW);
+  }
+}
+
+// Turns all relays OFF.
+// This is useful during setup and after a sequence finishes.
+void allRelaysOff() {
+  for (int i = 0; i < NUM_RELAYS; i++) {
+    setRelay(i, false);
+  }
+}
+
+// Returns a random unsigned long value between minVal and maxVal.
+// Arduino random() normally uses long values, so this helper converts cleanly.
+unsigned long randomRangeUL(unsigned long minVal, unsigned long maxVal) {
+  return (unsigned long)random((long)minVal, (long)maxVal + 1);
+}
+
+// ---------------- Start a New Relay Sequence ----------------
+
+void startNewSequence() {
+  Serial.println("Starting randomized 4-relay sequence...");
+
+  // Set up a new random pattern for each relay.
+  for (int i = 0; i < NUM_RELAYS; i++) {
+    relays[i].firstFlashesTarget  = random(FLASH_MIN, FLASH_MAX + 1);
+    relays[i].secondFlashesTarget = random(FLASH_MIN, FLASH_MAX + 1);
+
+    relays[i].firstFlashCount = 0;
+    relays[i].secondFlashCount = 0;
+
+    relays[i].steadyOnMs =
+      (unsigned long)random(ON_MIN_SEC, ON_MAX_SEC + 1) * 1000UL;
+
+    relays[i].flashOnMs =
+      randomRangeUL(FLASH_ON_MIN_MS, FLASH_ON_MAX_MS);
+
+    relays[i].flashOffMs =
+      randomRangeUL(FLASH_OFF_MIN_MS, FLASH_OFF_MAX_MS);
+
+    // Every relay starts with the first flashing section.
+    relays[i].state = FIRST_FLASH_ON;
+
+    // Save the current time as the start time of this state.
+    relays[i].stateStartMs = millis();
+
+    // Print relay settings for debugging in the Serial Monitor.
+    Serial.print("Relay ");
+    Serial.print(i + 1);
+    Serial.print(": first=");
+    Serial.print(relays[i].firstFlashesTarget);
+    Serial.print(", flashOn=");
+    Serial.print(relays[i].flashOnMs);
+    Serial.print("ms, flashOff=");
+    Serial.print(relays[i].flashOffMs);
+    Serial.print("ms, steady=");
+    Serial.print(relays[i].steadyOnMs / 1000);
+    Serial.print("s, second=");
+    Serial.println(relays[i].secondFlashesTarget);
+
+    // Turn relay ON to begin the first flash.
+    setRelay(i, true);
+  }
+
+  // Mark sequence as active.
+  sequenceRunning = true;
+
+  // Clear saved trigger because it is now being handled.
+  pendingTrigger = false;
+}
+
+// ---------------- Update One Relay ----------------
+
+/*
+  This function controls one relay without blocking the Arduino.
+
+  It checks which state the relay is currently in and decides whether
+  enough time has passed to move to the next state.
+
+  This avoids using delay(), which would freeze the Arduino and stop it
+  from listening for LoRa packets while the lights are running.
+*/
+void updateRelay(int i, unsigned long now) {
+  switch (relays[i].state) {
+
+    case IDLE:
+      setRelay(i, false);
+      break;
+
+    case FIRST_FLASH_ON:
+      if (now - relays[i].stateStartMs >= relays[i].flashOnMs) {
+        setRelay(i, false);
+        relays[i].state = FIRST_FLASH_OFF;
+        relays[i].stateStartMs = now;
+      }
+      break;
+
+    case FIRST_FLASH_OFF:
+      if (now - relays[i].stateStartMs >= relays[i].flashOffMs) {
+        relays[i].firstFlashCount++;
+
+        if (relays[i].firstFlashCount >= relays[i].firstFlashesTarget) {
+          relays[i].state = GAP1_OFF;
+          relays[i].stateStartMs = now;
+          setRelay(i, false);
+        } else {
+          relays[i].state = FIRST_FLASH_ON;
+          relays[i].stateStartMs = now;
+          setRelay(i, true);
+        }
+      }
+      break;
+
+    case GAP1_OFF:
+      if (now - relays[i].stateStartMs >= BETWEEN_MS) {
+        relays[i].state = STEADY_ON;
+        relays[i].stateStartMs = now;
+        setRelay(i, true);
+      }
+      break;
+
+    case STEADY_ON:
+      if (now - relays[i].stateStartMs >= relays[i].steadyOnMs) {
+        relays[i].state = GAP2_OFF;
+        relays[i].stateStartMs = now;
+        setRelay(i, false);
+      }
+      break;
+
+    case GAP2_OFF:
+      if (now - relays[i].stateStartMs >= BETWEEN_MS) {
+        relays[i].flashOnMs =
+          randomRangeUL(FLASH_ON_MIN_MS, FLASH_ON_MAX_MS);
+
+        relays[i].flashOffMs =
+          randomRangeUL(FLASH_OFF_MIN_MS, FLASH_OFF_MAX_MS);
+
+        relays[i].state = SECOND_FLASH_ON;
+        relays[i].stateStartMs = now;
+        setRelay(i, true);
+      }
+      break;
+
+    case SECOND_FLASH_ON:
+      if (now - relays[i].stateStartMs >= relays[i].flashOnMs) {
+        setRelay(i, false);
+        relays[i].state = SECOND_FLASH_OFF;
+        relays[i].stateStartMs = now;
+      }
+      break;
+
+    case SECOND_FLASH_OFF:
+      if (now - relays[i].stateStartMs >= relays[i].flashOffMs) {
+        relays[i].secondFlashCount++;
+
+        if (relays[i].secondFlashCount >= relays[i].secondFlashesTarget) {
+          relays[i].state = DONE;
+          relays[i].stateStartMs = now;
+          setRelay(i, false);
+        } else {
+          relays[i].state = SECOND_FLASH_ON;
+          relays[i].stateStartMs = now;
+          setRelay(i, true);
+        }
+      }
+      break;
+
+    case DONE:
+      setRelay(i, false);
+      break;
+  }
+}
+
+// Checks whether all 4 relays have reached the DONE state.
+bool allRelaysDone() {
+  for (int i = 0; i < NUM_RELAYS; i++) {
+    if (relays[i].state != DONE) return false;
+  }
+
+  return true;
+}
+
+// ---------------- LoRa Message Parsing ----------------
+
+// Extracts the first number found in an incoming LoRa message.
+// Example: if the message is "value:0.34", this function returns 0.34.
+float extractFirstFloat(const String& s) {
+  int start = -1;
+
+  // Find where the number begins.
+  for (int i = 0; i < (int)s.length(); i++) {
+    char c = s[i];
+
+    if ((c >= '0' && c <= '9') || c == '+' || c == '-' || c == '.') {
+      start = i;
+      break;
+    }
+  }
+
+  // If no number is found, return NAN.
+  if (start < 0) return NAN;
+
+  int end = start;
+  bool seenDigit = false;
+
+  // Continue reading characters that could be part of a number.
+  for (; end < (int)s.length(); end++) {
+    char c = s[end];
+
+    if (c >= '0' && c <= '9') {
+      seenDigit = true;
+      continue;
+    }
+
+    if (c == '.' || c == 'e' || c == 'E' || c == '+' || c == '-') {
+      continue;
+    }
+
+    break;
+  }
+
+  // If no actual digit was found, the value is invalid.
+  if (!seenDigit) return NAN;
+
+  String num = s.substring(start, end);
+  return num.toFloat();
+}
+
+// Checks if the received number is close enough to one of the target values.
+bool isValidTrigger(float v) {
+  return fabs(v - TARGET1) <= TOL || fabs(v - TARGET2) <= TOL;
+}
+
+// ---------------- Setup ----------------
+
+void setup() {
+  // Set all relay pins as outputs and mark relays as idle.
+  for (int i = 0; i < NUM_RELAYS; i++) {
+    pinMode(RELAY_PINS[i], OUTPUT);
+    relays[i].state = IDLE;
+  }
+
+  // Make sure no relay starts on accidentally.
+  allRelaysOff();
+
+  // Start Serial Monitor for debugging.
+  Serial.begin(9600);
+  delay(300);
+
+  Serial.println("Booting LoRa receiver...");
+
+  // Tell LoRa library which Arduino pins are connected to the LoRa module.
+  LoRa.setPins(LORA_CS, LORA_RST, LORA_DIO0);
+
+  // Start LoRa radio.
+  if (!LoRa.begin(LORA_FREQ)) {
+    Serial.println("LoRa.begin FAILED. Check wiring/pins/frequency.");
+
+    // Stop program here if LoRa fails.
+    while (true) {
+      delay(1000);
+    }
+  }
+
+  // Apply sync word only if enabled.
+  if (USE_SYNC_WORD) {
+    LoRa.setSyncWord(SYNC_WORD);
+  }
+
+  // Creates more random-looking relay patterns.
+  randomSeed(analogRead(A0));
+
+  Serial.println("LoRa receiver READY.");
+  Serial.print("Triggers: ");
+  Serial.print(TARGET1, 2);
+  Serial.print(" or ");
+  Serial.println(TARGET2, 2);
+  Serial.println("Waiting for packets...");
+}
+
+// ---------------- Main Loop ----------------
+
+/*
+  Main loop summary:
+
+  1. Save the current time using millis().
+  2. If a relay sequence is running, update all relays.
+  3. If all relays are done, stop the sequence and begin cooldown.
+  4. Check for incoming LoRa packets.
+  5. If the packet contains a valid trigger, start the sequence.
+  6. If the system is busy, save the trigger and start it later.
+*/
+void loop() {
+  unsigned long now = millis();
+
+  // Keep relay sequence running if it has already started.
+  if (sequenceRunning) {
+    for (int i = 0; i < NUM_RELAYS; i++) {
+      updateRelay(i, now);
+    }
+
+    // Once all relays finish their pattern, reset the system.
+    if (allRelaysDone()) {
+      sequenceRunning = false;
+      lastTriggerMs = now;
+      allRelaysOff();
+
+      Serial.println("Sequence complete. Waiting for next valid signal...");
+
+      for (int i = 0; i < NUM_RELAYS; i++) {
+        relays[i].state = IDLE;
+      }
+    }
+  }
+
+  // Check whether a LoRa packet has arrived.
+  int packetSize = LoRa.parsePacket();
+
+  if (packetSize) {
+    String msg = "";
+
+    // Read the entire incoming LoRa message.
+    while (LoRa.available()) {
+      msg += (char)LoRa.read();
+    }
+
+    msg.trim();
+
+    // Convert the message into a usable number.
+    float v = extractFirstFloat(msg);
+
+    // RSSI shows signal strength of the received packet.
+    int rssi = LoRa.packetRssi();
+
+    Serial.print("RX raw='");
+    Serial.print(msg);
+    Serial.print("'  parsed=");
+
+    if (isnan(v)) {
+      Serial.print("NAN");
+    } else {
+      Serial.print(v, 4);
+    }
+
+    Serial.print("  RSSI=");
+    Serial.println(rssi);
+
+    // Only react if the packet contains a valid trigger value.
+    if (!isnan(v) && isValidTrigger(v)) {
+      if (sequenceRunning || (now - lastTriggerMs < COOLDOWN_MS)) {
+        pendingTrigger = true;
+        Serial.println("Valid trigger received but busy/cooling down -> saved for later.");
+      } else {
+        Serial.println("MATCH! Trigger received.");
+        startNewSequence();
+        return;
+      }
+    }
+  }
+
+  // If a valid trigger was saved earlier, start it once the system is ready.
+  if (!sequenceRunning && pendingTrigger && (now - lastTriggerMs >= COOLDOWN_MS)) {
+    Serial.println("Starting saved trigger now.");
+    startNewSequence();
+  }
+}
